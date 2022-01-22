@@ -13,10 +13,23 @@ public:
     bool loadData(const std::string &filename,
                   const int inDim,
                   const int startRow = 0);
+
+    /**
+     * @brief train
+     * @param batch
+     * @param nEpoches
+     * @param learningRate
+     * @param cb
+     * @param validateEpoch if set to > 0, a validation test over with given data will be conducted every validateEpoch
+     * @param cb2 Being the callback when validateEpoch > 0
+     * @return
+     */
     bool train(const int batch = 4,
                const int nEpoches = 100,
                const double learningRate = 1e-3,
-               std::function<void (int, double)> *cb = nullptr);
+               std::function<void (int, double)> *cb = nullptr,
+               const int validateEpoch = -1,
+               std::function<void (int, double, double)> *cb2 = nullptr);
 
     /**
      * @brief Call loadData() to append the history data before calling test().
