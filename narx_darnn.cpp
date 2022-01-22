@@ -4,10 +4,12 @@
 struct DecoderImpl : torch::nn::Module {
     DecoderImpl(int64_t inDim,
                 int64_t delay,
-                int64_t layerWidth)
+                int64_t layerWidth,
+                int64_t lstmLayers)
         : m_inDim(inDim),
           m_delay(delay),
-          m_decWidth(layerWidth)
+          m_decWidth(layerWidth),
+          m_lstmLayers(lstmLayers)
     {
         linear = register_module("Linear", torch::nn::Linear(m_inDim+1, 1));
         linear->weight.data().normal_();
@@ -20,22 +22,21 @@ struct DecoderImpl : torch::nn::Module {
                     torch::nn::Linear(m_inDim, 1)
                     ));
         auto lstm_options = torch::nn::LSTMOptions(1, m_decWidth);
-        lstm_options.num_layers(1);
+        lstm_options.num_layers(m_lstmLayers);
         lstm = register_module("LSTM",torch::nn::LSTM(lstm_options));
 
     }
     torch::Tensor forward(torch::Tensor X_enc, torch::Tensor y_delay) {
-        auto options = torch::TensorOptions();
-        options = options.requires_grad(true);
-        auto dN = X_enc.new_zeros(c10::IntArrayRef({1, X_enc.size(0), m_decWidth}), options);
-        auto cN = X_enc.new_zeros(c10::IntArrayRef({1, X_enc.size(0), m_decWidth}), options);
+        auto dN = X_enc.new_zeros(c10::IntArrayRef({m_lstmLayers, X_enc.size(0), m_decWidth}));
+        auto cN = X_enc.new_zeros(c10::IntArrayRef({m_lstmLayers, X_enc.size(0), m_decWidth}));
 
         const auto py_colon = at::indexing::Slice(at::indexing::None, at::indexing::None);
 
+        const int lstmIdx_out = m_lstmLayers - 1;
         torch::Tensor context;
         for ( int t=0; t<m_delay; ++t ) {
-            auto x = torch::cat({dN.repeat({m_delay, 1, 1}).permute({1, 0, 2}),
-                                 cN.repeat({m_delay, 1, 1}).permute({1, 0, 2}),
+            auto x = torch::cat({dN[lstmIdx_out].repeat({m_delay, 1, 1}).permute({1, 0, 2}),
+                                 cN[lstmIdx_out].repeat({m_delay, 1, 1}).permute({1, 0, 2}),
                                 X_enc}, 2);
             auto _b = torch::nn::functional::softmax(
                         attd->forward(x.view({-1, 2*m_decWidth + m_inDim})).view({-1, m_delay}), 1
@@ -55,13 +56,14 @@ struct DecoderImpl : torch::nn::Module {
                 cN = std::get<1>(outStatues);
             }
         }
-        auto y_pred = linear_out->forward(torch::cat({dN[0], context}, 1));
+        auto y_pred = linear_out->forward(torch::cat({dN[m_lstmLayers-1], context}, 1));
         return y_pred;
     }
 
     int64_t m_inDim;
     int64_t m_delay;
     int64_t m_decWidth;
+    int64_t m_lstmLayers;
     torch::nn::Linear linear = nullptr,
                       linear_out = nullptr;
     torch::nn::Sequential attd = nullptr;
@@ -72,33 +74,34 @@ TORCH_MODULE(Decoder);
 struct EncoderImpl : torch::nn::Module {
     EncoderImpl(int64_t inDim,
                 int64_t delay,
-                int64_t layerWidth):
+                int64_t layerWidth,
+                int64_t lstmLayers):
         m_inDim(inDim),
         m_delay(delay),
-        m_encWidth(layerWidth)
+        m_encWidth(layerWidth),
+        m_lstmLayers(lstmLayers)
     {
         m_attd = register_module("Attd", torch::nn::Linear(
                                      2 * m_encWidth + delay,    //in_feature
                                      1                          //out_feature
                                      ));
-        m_lstm = register_module("LSTM", torch::nn::LSTM(m_inDim,   //input_size
-                                                         m_encWidth //hidden_size
-                                                         ));
+        auto lstmOptions = torch::nn::LSTMOptions(m_inDim, m_encWidth);
+        lstmOptions.num_layers(m_lstmLayers);
+        m_lstm = register_module("LSTM", torch::nn::LSTM(lstmOptions));
     }
     std::tuple<at::Tensor, at::Tensor> forward(torch::Tensor X) {
-        auto options = torch::TensorOptions();
-        options = options.requires_grad(true);
-        auto X_tilde = X.new_zeros({X.size(0), m_delay, m_inDim}, options);
-        auto X_enc = X.new_zeros({X.size(0), m_delay, m_encWidth}, options);
+        auto X_tilde = X.new_zeros({X.size(0), m_delay, m_inDim});
+        auto X_enc = X.new_zeros({X.size(0), m_delay, m_encWidth});
 
-        auto hN = X.new_zeros({1, X.size(0), m_encWidth}, options);
-        auto sN = X.new_zeros({1, X.size(0), m_encWidth}, options);
+        auto hN = X.new_zeros({m_lstmLayers, X.size(0), m_encWidth});
+        auto sN = X.new_zeros({m_lstmLayers, X.size(0), m_encWidth});
 
         const auto py_colon = at::indexing::Slice(at::indexing::None, at::indexing::None);
 
+        const int lstmIdx_out = m_lstmLayers - 1;
         for (int t=0; t<m_delay; ++t ) {
-            auto x = torch::cat({hN.repeat({m_inDim, 1, 1}).permute({1, 0, 2}),
-                                 sN.repeat({m_inDim, 1, 1}).permute({1, 0, 2}),
+            auto x = torch::cat({hN[lstmIdx_out].repeat({m_inDim, 1, 1}).permute({1, 0, 2}),
+                                 sN[lstmIdx_out].repeat({m_inDim, 1, 1}).permute({1, 0, 2}),
                                  X.permute({0, 2, 1})},
                                 2 );
             x = m_attd->forward(x.view({-1, 2 * m_encWidth + m_delay}));
@@ -113,7 +116,7 @@ struct EncoderImpl : torch::nn::Module {
             sN = std::get<1>(encState);
 
             X_tilde.index({py_colon, t, py_colon}) = x_tilde;
-            X_enc.index({py_colon, t, py_colon}) = hN[0];
+            X_enc.index({py_colon, t, py_colon}) = hN[lstmIdx_out];
 
         }
       return std::make_tuple(X_tilde, X_enc);
@@ -121,6 +124,7 @@ struct EncoderImpl : torch::nn::Module {
     int64_t m_inDim;
     int64_t m_delay;
     int64_t m_encWidth;
+    int64_t m_lstmLayers;
     torch::nn::Linear m_attd = nullptr;
     torch::nn::LSTM m_lstm = nullptr;
 };
@@ -130,14 +134,18 @@ struct DARNNImpl : torch::nn::Module {
     DARNNImpl(  int64_t inDim,
                 int64_t delay,
                 int64_t encLayerWidth = 128,
-                int64_t decLayerWidth = 128):
+                int64_t encLSTMLayers = 1,
+                int64_t decLayerWidth = 128,
+                int64_t decLSTMLayers = 1):
         m_inDim(inDim),
         m_delay(delay),
         m_encWidth(encLayerWidth),
-        m_decWidth(decLayerWidth)
+        m_encLSTMLayers(encLSTMLayers),
+        m_decWidth(decLayerWidth),
+        m_decLSTMLayers(decLSTMLayers)
     {
-        encoder = register_module("Encoder", Encoder(inDim, delay, encLayerWidth));
-        decoder = register_module("Decoder", Decoder(encLayerWidth, delay, decLayerWidth));
+        encoder = register_module("Encoder", Encoder(inDim, delay, encLayerWidth, encLSTMLayers));
+        decoder = register_module("Decoder", Decoder(encLayerWidth, delay, decLayerWidth, decLSTMLayers));
     }
 
     torch::Tensor forward(torch::Tensor X, torch::Tensor y_prev) {
@@ -152,7 +160,9 @@ struct DARNNImpl : torch::nn::Module {
     int64_t m_inDim;
     int64_t m_delay;
     int64_t m_encWidth;
+    int64_t m_encLSTMLayers;
     int64_t m_decWidth;
+    int64_t m_decLSTMLayers;
 
     Encoder encoder = nullptr;
     Decoder decoder = nullptr;
@@ -182,8 +192,8 @@ NARX_DARNN::NARX_DARNN(int inDim, int delay, int stride) :
     m->delay = delay;
     m->stride = stride;
 
-    m->net = DARNN(4, m->delay);
-    torch::load(m->net, "model_5000.pt");
+    m->net = DARNN(4, m->delay, 64, 2, 64, 1);
+    //torch::load(m->net, "model_4000.pt");
     m->net->to(*m->device);
 
     std::cout << m->net << std::endl;
@@ -212,7 +222,9 @@ bool NARX_DARNN::loadData(const std::string &filename, const int inDim, const in
 
 bool NARX_DARNN::train(const int batch, const int nEpoches,
                        const double learningRate,
-                       std::function<void (int, double)> *cb)
+                       std::function<void (int, double)> *cb,
+                       const int validateEpoch,
+                       std::function<void (int, double, double)> *cb2)
 {
     printf("Prepare Training");
     const int nRows = m->X_train.size(0);
@@ -222,8 +234,6 @@ bool NARX_DARNN::train(const int batch, const int nEpoches,
     auto options = torch::optim::AdamOptions(learningRate);
     auto encOptim = std::make_shared<torch::optim::Adam>(m->net->encoder->parameters(), options);
     auto decOptim = std::make_shared<torch::optim::Adam>(m->net->decoder->parameters(), options);
-
-    m->net->train();
 
     //Prepare Samples
     torch::TensorOptions tensorOptions;
@@ -282,6 +292,9 @@ bool NARX_DARNN::train(const int batch, const int nEpoches,
     printf("Start training. Batch : %u, Epoches : %u\n", batch, nEpoches);
 
     for ( int i=0; i<nEpoches; ++i ) {
+        m->net->train();
+        torch::AutoGradMode auto_grad(true);
+
         double eloss = 0;
 
         const int nBatches = X_train.size();
@@ -319,11 +332,16 @@ bool NARX_DARNN::train(const int batch, const int nEpoches,
         if ( cb ) {
             (*cb)(i, eloss);
         }
+
         if ( 0 == (i+1) % 100 ) {
             char filename[32];
             sprintf(filename, "model_%d.pt", i+1);
             std::cout << "Save model " << filename << std::endl;
             torch::save(m->net, filename);
+        }
+        if ( 0 < validateEpoch && 0 == i % validateEpoch ) {
+            test("CoolingLoadOct-Dec.csv",
+                 cb2);
         }
     }
     return true;
@@ -345,6 +363,7 @@ bool NARX_DARNN::test(const std::string &file,
     auto _Y = torch::Tensor();
     if ( m->inDim < _X.size(1)) {
         bHasValue = true;
+        std::cout << "Has True Values" << std::endl;
         _Y = _X.index({py_colon, towerID});
     }
 
